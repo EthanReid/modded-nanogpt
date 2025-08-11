@@ -9,6 +9,7 @@ import glob
 from dataclasses import dataclass
 from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
+import wandb
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -159,6 +160,63 @@ class Muon(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
 
     @torch.no_grad()
+    def _top_singular_triplet(self, W: Tensor, n_iter: int = 5):
+        """Top singular (u, v, sigma) via two-sided power iteration; float32; no caching."""
+        Wf = W.to(dtype=torch.float32)
+        n = Wf.shape[-1]
+        v = torch.randn(n, device=W.device, dtype=torch.float32)
+        v = F.normalize(v, dim=0, eps=1e-12)
+        for _ in range(n_iter):
+            u = F.normalize(Wf.matmul(v), dim=0, eps=1e-12)
+            v = F.normalize(Wf.t().matmul(u), dim=0, eps=1e-12)
+        sigma = u.dot(Wf.matmul(v))
+        return u, v, sigma
+
+    @torch.no_grad()
+    def _cap_top_sigma_rank1(self, W: Tensor, u: Tensor, v: Tensor, sigma: Tensor, target: float):
+        """Set top singular value to min(sigma, target) by a rank-1 correction."""
+        s = float(sigma)
+        if s <= target + 1e-6:
+            return
+        delta = s - float(target)
+        # W ← W − delta * u v^T (update in W's dtype)
+        W.addmm_(u[:, None].to(W.dtype), v[None, :].to(W.dtype), alpha=-delta)
+
+    @torch.no_grad()
+    def _qk_product_cap(self, qkv: Tensor, cap: float, iters: int):
+        assert qkv.ndim == 3 and qkv.size(0) >= 2
+        H = int(getattr(qkv, "qkv_num_heads", 0) or 0)
+        Dh = int(getattr(qkv, "qkv_head_dim", 0) or 0)
+
+        if H <= 0 or Dh <= 0 or qkv.size(1) != H * Dh:
+            Q, K = qkv[0], qkv[1]
+            uq, vq, sq = self._top_singular_triplet(Q, n_iter=iters)
+            uk, vk, sk = self._top_singular_triplet(K, n_iter=iters)
+            prod = float(sq * sk)
+            if prod <= cap:
+                return
+            s = (cap / prod) ** 0.5
+            self._cap_top_sigma_rank1(Q, uq, vq, sq, float(sq) * s)
+            self._cap_top_sigma_rank1(K, uk, vk, sk, float(sk) * s)
+            return
+
+        D_in = qkv.size(-1)
+        Q = qkv[0].view(H, Dh, D_in)
+        K = qkv[1].view(H, Dh, D_in)
+        eps = 1e-6
+        for h in range(H):
+            uq, vq, sq = self._top_singular_triplet(Q[h], n_iter=iters)
+            uk, vk, sk = self._top_singular_triplet(K[h], n_iter=iters)
+            prod = float(sq * sk)
+            if prod <= cap:
+                continue
+            s = (cap / max(prod, eps)) ** 0.5
+            target_sq = float(sq) * s
+            target_sk = float(sk) * s
+            self._cap_top_sigma_rank1(Q[h], uq, vq, sq, target_sq)
+            self._cap_top_sigma_rank1(K[h], uk, vk, sk, target_sk)
+
+    @torch.no_grad()
     def step(self):
         # Efficient systems-wise implementation of step developed by @YouJiacheng,
         # @KonstantinWilleke, @alexrgilbert, @adricarda, @tuttyfrutyee, @vdlad,
@@ -198,6 +256,11 @@ class Muon(torch.optim.Optimizer):
                     grad = grad.lerp_(momentum_buffer, momentum)
                     v = zeropower_via_newtonschulz5(grad.bfloat16(), 5)
                     p.add_(other=v, alpha=-eff_lr)
+
+                    if getattr(p, "is_qkv", False):
+                        cap = float(getattr(p, "qk_cap", 2.0))
+                        iters = int(getattr(p, "qk_pca_iters", 5))
+                        self._qk_product_cap(p, cap=cap, iters=iters)
                 idx += 1
                 all_reduce_futures.append(dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank], async_op=True).get_future())
         torch.futures.collect_all(all_reduce_futures).wait()
@@ -333,6 +396,12 @@ class CausalSelfAttention(nn.Module):
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
+
+        self.qkv_w.is_qkv = True
+        self.qkv_w.qk_cap = 0.5
+        self.qkv_w.qk_pca_iters = 5
+        self.qkv_w.qkv_num_heads = num_heads
+        self.qkv_w.qkv_head_dim = head_dim
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
@@ -341,19 +410,28 @@ class CausalSelfAttention(nn.Module):
         self.attn_scale = 0.12
 
     def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor, block_mask: BlockMask):
-        B, T = x.size(0), x.size(1) # batch size, sequence length
+        B, T = x.size(0), x.size(1)  # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = norm(q), norm(k)  # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         if ve is not None:
-            v = lambdas[0] * v + lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
-        else: # skip mid-layers token value embeddings by @YouJiacheng
+            v = lambdas[0] * v + lambdas[1] * ve.view_as(v)  # @KoszarskyB & @Grad62304977
+        else:  # skip mid-layers token value embeddings by @YouJiacheng
             v = lambdas[0] * v
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
+        out, lse = flex_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            block_mask=block_mask,
+            scale=self.attn_scale,
+            return_lse=True,
+        )
+        y = out.transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)  # re-assemble all head outputs side by side
         y = self.c_proj(y)
-        return y
+        lse_max = lse.detach().max()
+        return y, lse_max
 
 class MLP(nn.Module):
     def __init__(self, dim: int):
@@ -378,10 +456,15 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor, block_mask: BlockMask):
         x = lambdas[0] * x + lambdas[1] * x0
+        lse_max = None
         if self.attn is not None:
-            x = x + self.attn(norm(x), ve, sa_lambdas, block_mask)
+            y, lse_layer = self.attn(norm(x), ve, sa_lambdas, block_mask)
+            x = x + y
+            lse_max = lse_layer
         x = x + self.mlp(norm(x))
-        return x
+        if lse_max is None:
+            lse_max = torch.tensor(float("-inf"), device=x.device, dtype=torch.float32)
+        return x, lse_max
 
 # -----------------------------------------------------------------------------
 # The main model
@@ -471,7 +554,7 @@ class GPT(nn.Module):
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(block_masks) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x = x0 = norm(self.embed(input_seq)[None])  # use of norm here by @Grad62304977
 
         # U-net design by @brendanh0gan
         skip_connections = []
@@ -481,10 +564,13 @@ class GPT(nn.Module):
 
         n = len(self.blocks) // 2
 
+        lse_max = torch.tensor(float("-inf"), device=x.device, dtype=torch.float32)
+
         for i in range(len(self.blocks)):
             if i >= n:
                 x = x + skip_weights[i - n] * skip_connections.pop()
-            x = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i], block_masks[i])
+            x, lse_layer = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i], block_masks[i])
+            lse_max = torch.maximum(lse_max, lse_layer)
             if i < n:
                 skip_connections.append(x)
 
@@ -493,7 +579,7 @@ class GPT(nn.Module):
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction="sum" if self.training else "mean")
-        return loss
+        return loss, lse_max
 
 # -----------------------------------------------------------------------------
 # Distributed data loader
@@ -561,7 +647,7 @@ class Hyperparameters:
     train_seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 1750 # number of iterations to run
+    num_iterations = 3000 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -571,7 +657,7 @@ args = Hyperparameters()
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 8 # this code is designed for 8xH100
+assert world_size == 4 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -586,6 +672,7 @@ if master_process:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
+    wandb.init(project="nanogpt", name=f"run_{run_id}")
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
@@ -650,6 +737,76 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
+@torch.no_grad()
+def _top_singular_value(A: Tensor, n_iter: int = 5) -> Tensor:
+    """Estimate the largest singular value of A via power iteration on A^T A.
+    A: (out_features, in_features)
+    Returns a scalar tensor on the same device.
+    """
+    # use float32 for stability regardless of model dtype
+    A = A.to(dtype=torch.float32)
+    # right singular vector lives in input space (in_features)
+    v = torch.randn(A.size(1), device=A.device, dtype=torch.float32)
+    v = F.normalize(v, dim=0)
+    for _ in range(n_iter):
+        # power iters on A^T A
+        v = A.t().matmul(A.matmul(v))
+        v = F.normalize(v, dim=0)
+    Av = A.matmul(v)
+    return Av.norm(2)
+
+@torch.no_grad()
+def log_qk_spectral_norms(model: nn.Module, step: int, n_iter: int = 5) -> None:
+    """Compute spectral norms for Q and K projection weights in each attention block,
+    average across ranks, and log from rank 0 to Weights & Biases.
+    Also logs an upper bound for ||QK^T|| as ||Q|| * ||K|| per layer.
+    """
+    q_vals: list[Tensor] = []
+    k_vals: list[Tensor] = []
+    layer_ids: list[int] = []
+
+    # Collect local estimates per attention layer
+    for li, block in enumerate(model.blocks):
+        attn = getattr(block, "attn", None)
+        if attn is None:
+            continue
+        # qkv_w shape: (3, hdim, dim); indices 0->Q, 1->K
+        q_w = attn.qkv_w[0]
+        k_w = attn.qkv_w[1]
+        q_vals.append(_top_singular_value(q_w, n_iter))
+        k_vals.append(_top_singular_value(k_w, n_iter))
+        layer_ids.append(li)
+
+    if not q_vals:
+        return
+
+    q = torch.stack(q_vals)
+    k = torch.stack(k_vals)
+    qk = q * k  # upper bound on ||QK^T||
+
+    # Aggregate across GPUs (average)
+    dist.all_reduce(q, op=dist.ReduceOp.SUM)
+    dist.all_reduce(k, op=dist.ReduceOp.SUM)
+    dist.all_reduce(qk, op=dist.ReduceOp.SUM)
+    q /= world_size
+    k /= world_size
+    qk /= world_size
+
+    if master_process:
+        log = {"step": step}
+        for j, li in enumerate(layer_ids):
+            log[f"spec_norm/q/layer_{li}"] = float(q[j].item())
+            log[f"spec_norm/k/layer_{li}"] = float(k[j].item())
+            log[f"spec_norm/qk_upper_bound/layer_{li}"] = float(qk[j].item())
+        # summary stats
+        log["spec_norm/q/mean"] = float(q.mean().item())
+        log["spec_norm/k/mean"] = float(k.mean().item())
+        log["spec_norm/q/max"] = float(q.max().item())
+        log["spec_norm/k/max"] = float(k.max().item())
+        log["spec_norm/qk_upper_bound/mean"] = float(qk.mean().item())
+        log["spec_norm/qk_upper_bound/max"] = float(qk.max().item())
+        wandb.log(log)
+
 model: nn.Module = torch.compile(model, dynamic=False)
 
 ########################################
@@ -663,7 +820,8 @@ initial_state = dict(model=copy.deepcopy(model.state_dict()),
 train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(1)).backward()
+    loss, _lse = model(inputs, targets, get_window_size_blocks(1))
+    loss.backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
@@ -697,13 +855,22 @@ for step in range(train_steps + 1):
         val_steps = args.val_tokens // val_batch_size
         val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False)
         val_loss = 0
+        lse_max_local = torch.tensor(float("-inf"), device=device, dtype=torch.float32)
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
-                val_loss += model(inputs, targets, get_window_size_blocks(step))
+                loss_step, lse_step = model(inputs, targets, get_window_size_blocks(step))
+                val_loss += loss_step
+                lse_max_local = torch.maximum(lse_max_local, lse_step)
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        lse_max_mean = lse_max_local.clone()
+        dist.all_reduce(lse_max_mean, op=dist.ReduceOp.SUM)
+        lse_max_mean /= world_size
+        log_qk_spectral_norms(model, step)
+        if master_process:
+            wandb.log({"val_loss": val_loss.item(), "attn/lse_max_mean": lse_max_mean.item(), "step": step})
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
@@ -720,7 +887,11 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    loss, _lse = model(inputs, targets, get_window_size_blocks(step))
+    loss.backward()
+    # log training loss
+    if master_process:
+        wandb.log({"train_loss": loss.item(), "step": step + 1})
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
@@ -739,4 +910,6 @@ for step in range(train_steps + 1):
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+if master_process:
+    wandb.finish()
 dist.destroy_process_group()
